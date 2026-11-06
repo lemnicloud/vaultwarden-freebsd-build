@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  freebsd-amd64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.1"
+          arch: x86_64
+          mem: 10240
+          cache-after-prepare: true
+          prepare: |
+            set -eu
+            export ASSUME_ALWAYS_YES=yes
+            pkg install -y podman-suite
+
+            mount -t fdescfs | grep -q 'on /dev/fd' || mount -t fdescfs fdesc /dev/fd
+
+            if [ -f /usr/local/etc/containers/storage.conf.sample ] && [ ! -f /usr/local/etc/containers/storage.conf ]; then
+              cp /usr/local/etc/containers/storage.conf.sample /usr/local/etc/containers/storage.conf
+            fi
+
+            if zfs list zroot >/dev/null 2>&1; then
+              if ! zfs list zroot/containers >/dev/null 2>&1; then
+                zfs create -o mountpoint=/var/db/containers zroot/containers
+                zfs snapshot zroot/containers@empty
+              fi
+            else
+              sed -I .bak -e 's/driver = "zfs"/driver = "vfs"/' /usr/local/etc/containers/storage.conf
+            fi
+
+            iface=$(route -n get default | awk '/interface:/ { print $2; exit }')
+            test -n "${iface}"
+            {
+              echo "v4egress_if = \"${iface}\""
+              echo "v6egress_if = \"${iface}\""
+              echo "table <cni-nat>"
+              echo "nat on \$v4egress_if inet from <cni-nat> to any -> (\$v4egress_if)"
+              echo "nat on \$v6egress_if inet6 from <cni-nat> to !ff00::/8 -> (\$v6egress_if)"
+              echo 'rdr-anchor "cni-rdr/*"'
+              echo 'nat-anchor "cni-rdr/*"'
+              echo "set skip on lo"
+              echo "pass all"
+            } > /etc/pf.conf
+            grep -q 'fdescfs.*/dev/fd' /etc/fstab || printf '%s\n' 'fdescfs /dev/fd fdescfs rw 0 0' >> /etc/fstab
+            sysrc pf_enable=YES
+            grep -q '^net.inet.ip.forwarding=' /etc/sysctl.conf || printf '%s\n' 'net.inet.ip.forwarding=1' >> /etc/sysctl.conf
+            grep -q '^net.pf.filter_local=' /etc/sysctl.conf || printf '%s\n' 'net.pf.filter_local=1' >> /etc/sysctl.conf
+          run: |
+            set -eu
+            if [ "$(uname -m)" != "amd64" ]; then
+              echo "this workflow builds amd64 only" >&2
+              exit 1
+            fi
+            version="${GITHUB_REF_NAME#v}"
+            if [ -z "${version}" ]; then
+              echo "release tag is empty" >&2
+              exit 1
+            fi
+
+            df -h /
+            rm -rf out dist
+            mkdir -p out dist
+            podman build \
+              --target output \
+              --build-arg "VERSION=${version}" \
+              -o "type=local,dest=${PWD}/out" \
+              -f Containerfile \
+              .
+            test -f out/vaultwarden
+            test -d out/web-vault
+            file out/vaultwarden
+
+            name="vaultwarden-v${version}-freebsd-amd64"
+            staging=$(mktemp -d)
+            mkdir "${staging}/${name}"
+            cp out/vaultwarden "${staging}/${name}/vaultwarden"
+            cp -R out/web-vault "${staging}/${name}/web-vault"
+            chmod 755 "${staging}/${name}/vaultwarden"
+            tar -cf "${staging}/archive.tar" -C "${staging}" "${name}"
+            zstd -T0 -q -o "dist/${name}.tar.zst" "${staging}/archive.tar"
+            rm -rf "${staging}" out
+
+            hash=$(sha256 -q "dist/${name}.tar.zst")
+            printf '%s  %s\n' "${hash}" "${name}.tar.zst" > "dist/${name}.tar.zst.sha256"
+            echo "${hash}  ${name}.tar.zst"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release upload "${GITHUB_REF_NAME}" dist/*.tar.zst dist/*.sha256 --clobber
